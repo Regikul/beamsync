@@ -33,11 +33,7 @@ init(State) ->
             {bare, true},                 % The task can be run by the user, always true
             {deps, ?DEPS},                % The list of dependencies
             {example, "rebar3 beamsync"}, % How to use the plugin
-            {opts, [
-                {name, $n, "name", atom, "Gives a long name to the node"},
-                {sname, $s, "sname", atom, "Gives a short name to the node"},
-                {setcookie, $c, "setcookie", atom, "Sets the cookie"}
-            ]},                   % list of options understood by the plugin
+            {opts, []},                   % list of options understood by the plugin
             {short_desc, "A rebar plugin"},
             {desc, "A rebar plugin"}
     ]),
