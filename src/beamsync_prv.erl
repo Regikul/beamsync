@@ -5,11 +5,6 @@
 -define(PROVIDER, beamsync).
 -define(DEPS, [compile]).
 
--record(beamsync, {
-    nodes = [] :: [atom()],
-    mode :: shortname | longname
-}).
-
 -record(mod, {
     name :: module(),
     abs_path :: file:filename(),
