@@ -205,7 +205,7 @@ maybe_rewrite_name(Atom) when is_atom(Atom) ->
     list_to_atom(
         "beamsync_" ++ integer_to_list(
             binary:decode_unsigned(
-                rand:bytes(2)
+                crypto:strong_rand_bytes(2)
             )
         )
     ).
