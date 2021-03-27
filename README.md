@@ -1,12 +1,17 @@
 beamsync
 =====
 
-A rebar plugin
+A rebar plugin to do remote load for changed beam modules.
 
-Build
+Configure
 -----
+Add this to your rebar config:
 
-    $ rebar3 compile
+    {beamsync, [
+        {mode, longname | shortname},
+        {setcookie, 'your_super_secret_cookie'},
+        {nodes, ['your_node@somewhere']}
+    ]}.
 
 Use
 ---
@@ -14,7 +19,7 @@ Use
 Add the plugin to your rebar config:
 
     {plugins, [
-        {beamsync, {git, "https://host/user/beamsync.git", {tag, "0.1.0"}}}
+        {beamsync, {git, "https://github.com/regikul/beamsync.git", {tag, "0.1.0"}}}
     ]}.
 
 Then just call your plugin directly in an existing application:
