@@ -9,13 +9,16 @@
     name :: module(),
     abs_path :: file:filename(),
     content :: binary(),
-    vsn :: binary()
+    vsn :: [non_neg_integer()]
 }).
 
 -record(app, {
     name :: binary(),
-    beams :: list()
+    beams :: [#mod{}] | [file:filename_all()]
 }).
+
+-define(HELPER, beamsync_helper_with_unique_name).
+-define(COL_LEN, 30).
 
 %% ===================================================================
 %% Public API
@@ -37,25 +40,73 @@ init(State) ->
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
-%%    net_kernel:hidden_connect_node(Nodename),
-    Nodes = get_nodes(),
     DistName = dist_name(State),
-    BeamSyncName = beamsync_name(),
+    BeamSyncConfig = beamsync_config(),
+    Nodes = proplists:get_value(nodes, BeamSyncConfig),
+    BeamSyncName = find_names_cookie(BeamSyncConfig),
+    ExcludeApps = get_excluded(apps, BeamSyncConfig),
+    ExcludeModules = get_excluded(modules, BeamSyncConfig),
     {Long, Short, Cookie} = merge_names(DistName, BeamSyncName),
     rebar_dist_utils:either(Long, Short, Cookie),
     Apps = rebar_state:project_apps(State),
     Deps = rebar_state:all_deps(State),
-    SyncApps = lists:map(
+    AllApps = lists:map(
         fun read_all_modules/1,
         lists:map(fun describe_apps/1, Apps ++ Deps)
     ),
-    AppNames = lists:map(fun (#app{name = A}) -> A end, SyncApps),
+    AppNames = lists:map(fun (#app{name = A}) -> A end, AllApps),
     rebar_api:info("going to sync apps: ~p", [AppNames]),
     rebar_api:debug("node: ~p", [node()]),
     rebar_api:debug("remote nodes: ~p", [Nodes]),
     rebar_api:debug("cookie: ~p", [erlang:get_cookie()]),
-    sync_beams(SyncApps, Nodes),
+    SyncApps = exclude(ExcludeApps, ExcludeModules, AllApps),
+    Updated = sync_beams(SyncApps, Nodes),
+    print_errors(
+        lists:zip(Nodes, Updated)
+    ),
     {ok, State}.
+
+print_errors(Reports) ->
+    lists:map(fun lookup_errors/1, Reports).
+
+lookup_errors({Node, NodeReport}) ->
+    case lists:filter(fun just_errors/1, NodeReport) of
+        [] -> ok;
+        [_ | _] = Errors -> lists:foreach(do_print_errors(Node), Errors)
+    end.
+
+do_print_errors(Node) ->
+    rebar_api:error("failed to update on node ~s:", [Node]),
+    fun ({{error, Reason}, App}) ->
+        rebar_api:error("~s: ~p", [App, Reason])
+    end.
+
+just_errors({ok, _}) -> false;
+just_errors({{error, _}, _}) -> true.
+
+-spec exclude([atom()], [atom()], [#app{}]) -> [#app{}].
+exclude(Apps, Modules, SyncApps) ->
+    lists:filter(
+        outside_of(Apps),
+        lists:map(exclude_modules(Modules), SyncApps)
+    ).
+
+-spec outside_of([#app{}] | [#mod{}]) -> fun ((#app{} | #mod{}) -> boolean()).
+outside_of(ExcludeList) ->
+    fun
+        (#app{name = Name}) ->
+            not lists:member(binary_to_atom(Name, utf8), ExcludeList);
+        (#mod{name = Name}) ->
+            not lists:member(Name, ExcludeList)
+    end.
+
+-spec exclude_modules([atom()]) -> fun((#app{}) -> #app{}).
+exclude_modules(Modules) ->
+    fun (#app{beams = Beams} = App) ->
+        App#app{
+            beams = lists:filter(outside_of(Modules), Beams)
+        }
+    end.
 
 -spec describe_apps(rebar_app_info:t()) -> #app{}.
 describe_apps(App) ->
@@ -78,7 +129,7 @@ read_all_modules(#app{} = App) ->
         {DotPos, _} = lists:last(binary:matches(Basename, <<".">>)),
         ModuleName = binary:part(Basename, {0, DotPos}),
         {ok, Content} = file:read_file(BinPath),
-        {ok, {_, [Vsn]}} = beam_lib:version(Content),
+        {ok, {_, Vsn}} = beam_lib:version(Content),
         #mod{
             name = list_to_atom(
                 binary_to_list(ModuleName)
@@ -92,49 +143,50 @@ read_all_modules(#app{} = App) ->
          beams = lists:map(File2Module, AppFiles)
     }.
 
--spec sync_beams([#app{}], [node()]) -> ok.
+-spec sync_beams([#app{}], [node()]) -> list().
 sync_beams(Apps, Nodes) ->
-    lists:foreach(sync_node(Apps), Nodes).
+    pmap(sync_node(Apps), Nodes).
 
--spec sync_node([#app{}]) -> fun((node()) -> ok).
+-spec sync_node([#app{}]) -> fun((node()) -> list()).
 sync_node(Apps) ->
     fun(Node) ->
-        rebar_api:info("updating node ~p", [Node]),
         net_kernel:hidden_connect_node(Node),
-        lists:foreach(update_app_on_node(Node), Apps)
+        with_loaded_helper(Node, fun() ->
+            rebar_api:info("updating node ~p", [Node]),
+            pmap(update_app_on_node(Node), Apps)
+        end)
     end.
+
+with_loaded_helper(Node, Fun) ->
+    ?HELPER:migrate(Node),
+    Ret = Fun(),
+    ?HELPER:unload(Node),
+    Ret.
 
 -spec update_app_on_node(node()) -> fun((#app{}) -> ok).
 update_app_on_node(Node) ->
+    Prepare = fun (#mod{vsn = Vsn, name = Module}) ->
+        {Module, Vsn}
+    end,
     fun(App) ->
-        UpdateRequired = lists:filter(is_outdated(Node), App#app.beams),
-        do_update(Node, App#app{beams = UpdateRequired})
+        ModulesList = lists:map(Prepare, App#app.beams),
+        UpdateRequired = rpc:call(Node, ?HELPER, check, [ModulesList]),
+        UpdateList = make_update_list(App#app.beams, UpdateRequired),
+        do_update(Node, App#app{beams = UpdateList})
     end.
 
--spec is_outdated(node()) -> fun((#mod{}) -> boolean()).
-is_outdated(Node) ->
-    fun (#mod{} = Mod) ->
-        #mod{
-            vsn = OurVsn,
-            name = Module
-        } = Mod,
-        TheirAttrs = rpc:call(Node, Module, module_info, [attributes]),
-        [TheirVsn] = case TheirAttrs of
-                         List when is_list(List) -> proplists:get_value(vsn, TheirAttrs);
-                         _Else -> [not_found]
-                     end,
-        case TheirVsn =/= OurVsn of
-            true when is_integer(TheirVsn) ->
-                rebar_api:console("~p should be updated, versions differ", [Module]),
-                true;
-            _ ->
-                false
+make_update_list(Mods, UpdateRequired) ->
+    F = fun (#mod{name = Name} = Module, Acc) ->
+        case proplists:is_defined(Name, UpdateRequired) of
+            true -> [Module | Acc];
+            false -> Acc
         end
-    end.
+    end,
+    lists:foldl(F, [], Mods).
 
 -spec do_update(node(), #app{}) -> term().
-do_update(_Node, #app{beams = []}) ->
-    ok;
+do_update(_Node, #app{beams = []} = App) ->
+    {ok, App#app.name};
 do_update(Node, App) ->
     Prepare = fun (#mod{} = M, Acc) ->
         #mod{
@@ -147,8 +199,7 @@ do_update(Node, App) ->
     end,
     CodeMods = lists:foldl(Prepare, [], App#app.beams),
     Res = rpc:call(Node, code, atomic_load, [CodeMods]),
-    rebar_api:console("~s updated with result: ~p", [App#app.name, Res]),
-    Res.
+    {Res, App#app.name}.
 
 
 -spec format_error(any()) ->  iolist().
@@ -160,12 +211,14 @@ dist_name(State) ->
     [BeamSyncLong, BeamSyncShort] = lists:map(fun maybe_rewrite_name/1, [Long, Short]),
     {BeamSyncLong, BeamSyncShort, Opts}.
 
-beamsync_name() ->
+beamsync_config() ->
     RebarConfig = rebar_config:consult_root(),
-    case proplists:get_value(beamsync, RebarConfig) of
-        undefined -> {undefined, undefined, undefined};
-        [] -> {undefined, undefined, undefined};
-        [_ | _] = List -> find_names_cookie(List)
+    proplists:get_value(beamsync, RebarConfig, []).
+
+get_excluded(Entity, Config) when Entity =:= apps orelse Entity =:= modules ->
+    case proplists:get_value(excluded, Config, []) of
+        [] -> [];
+        Excluded -> proplists:get_value(Entity, Excluded, [])
     end.
 
 find_names_cookie(Props) ->
@@ -186,14 +239,6 @@ merge_names({DLong, _,      DCookie}, {_,     _,      _})       when DLong =/= u
 merge_names({_,     DShort, DCookie}, {_,     _,      _})       when DShort =/= undefined -> {undefined, DShort,    DCookie};
 merge_names({_,     _,      _},       {_,     _,      _})                                 -> {undefined, undefined, []}.
 
-get_nodes() ->
-    RebarConfig = rebar_config:consult_root(),
-    case proplists:get_value(beamsync, RebarConfig) of
-        undefined -> [];
-        [] -> [];
-        [_ | _] = List -> proplists:get_value(nodes, List)
-    end.
-
 maybe_rewrite_name(undefined) ->
     undefined;
 maybe_rewrite_name(Atom) when is_atom(Atom) ->
@@ -203,4 +248,28 @@ maybe_rewrite_name(Atom) when is_atom(Atom) ->
                 crypto:strong_rand_bytes(2)
             )
         )
+    ).
+
+pmap(F, List) ->
+    par(F, List, map).
+
+%%pforeach(F, List) ->
+%%    par(F, List, foreach).
+
+par(F, List, Impl) when Impl =:= map orelse Impl =:= foreach ->
+    Self = self(),
+    SpawnFun = fun (X) ->
+        Ref = erlang:make_ref(),
+        erlang:spawn(fun() ->
+            Self ! {'$pmap', Ref, F(X)}
+                     end),
+        Ref
+    end,
+    RecvFun = fun (Ref) ->
+        receive
+            {'$pmap', Ref, V} -> V
+        end
+    end,
+    lists:Impl(RecvFun,
+        lists:map(SpawnFun, List)
     ).
