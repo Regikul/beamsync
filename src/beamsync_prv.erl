@@ -198,6 +198,8 @@ do_update(Node, App) ->
         [{Name, Path, Content} | Acc]
     end,
     CodeMods = lists:foldl(Prepare, [], App#app.beams),
+    Modules = lists:map(fun (#mod{name = N}) -> N end, App#app.beams),
+    rebar_api:console("syncing modules for ~s on ~s: ~p", [App#app.name, Node, Modules]),
     Res = rpc:call(Node, code, atomic_load, [CodeMods]),
     {Res, App#app.name}.
 
